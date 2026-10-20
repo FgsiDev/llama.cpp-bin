@@ -10,12 +10,13 @@ name: Build llama.cpp (auto hardware)
 on:
   push:
     tags: ["v*"]
-    branches: [ "main" ]  
+    branches: ["main"]
+    paths-ignore: ["**.md"]
   workflow_dispatch:
     inputs:
       llama_ref:
         description: "llama.cpp branch / tag / commit to build"
-        default: "main"
+        default: "master"
       release:
         description: "Publish a GitHub Release"
         type: boolean
@@ -54,10 +55,28 @@ jobs:
       short: ${{ steps.meta.outputs.short }}
       build: ${{ steps.meta.outputs.build }}
     steps:
+      # The ref is for ggml-org/llama.cpp, not for this repo. If it does not exist
+      # there (e.g. "main" typed by habit), fall back to llama.cpp's default branch.
+      - name: Resolve llama.cpp ref
+        id: ref
+        run: |
+          URL=https://github.com/ggml-org/llama.cpp
+          REF="$LLAMA_REF"
+          if printf '%s' "$REF" | grep -Eq '^[0-9a-f]{7,40}$'; then
+            echo "Using commit $REF"
+          elif [ -n "$REF" ] && git ls-remote --exit-code "$URL" "refs/heads/$REF" "refs/tags/$REF" >/dev/null 2>&1; then
+            echo "Using ref $REF"
+          else
+            DEF=$(git ls-remote --symref "$URL" HEAD | awk '/^ref:/{sub("refs/heads/","",$2); print $2; exit}')
+            echo "::warning::ref '$REF' not found in ggml-org/llama.cpp, using default branch '$DEF'"
+            REF="$DEF"
+          fi
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v4
         with:
           repository: ggml-org/llama.cpp
-          ref: ${{ env.LLAMA_REF }}
+          ref: ${{ steps.ref.outputs.ref }}
           fetch-depth: 0
 
       - id: meta
@@ -231,6 +250,9 @@ jobs:
     container: nvidia/cuda:12.4.1-devel-ubuntu22.04
     continue-on-error: true
     timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Dependencies
         run: |
@@ -299,6 +321,9 @@ jobs:
     container: rocm/dev-ubuntu-22.04:6.4-complete
     continue-on-error: true
     timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Dependencies
         run: |
@@ -550,7 +575,8 @@ jobs:
   windows-cpu:
     name: cpu-windows-x86_64
     needs: ui
-    runs-on: windows-2022
+    # same runner image as upstream's release workflow (ships Clang 20, needed by GGML_OPENMP_FETCH)
+    runs-on: windows-2025-vs2026
     continue-on-error: true
     timeout-minutes: 120
     steps:
@@ -571,7 +597,7 @@ jobs:
       - name: Build
         shell: cmd
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          call "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
           cmake -S . -B build -G "Ninja Multi-Config" ^
             -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
             -DLLAMA_BUILD_BORINGSSL=ON ^
@@ -634,7 +660,7 @@ jobs:
   release:
     name: Publish release
     needs: [ui, linux, linux-armv7, cuda, rocm, android, android-opencl, macos, windows-cpu, windows-vulkan]
-    if: ${{ !cancelled() && needs.ui.result == 'success' && needs.linux.result == 'success' && needs.android.result == 'success' && needs.macos.result == 'success' && (github.ref_type == 'tag' || inputs.release) }}
+    if: ${{ !cancelled() && needs.ui.result == 'success' && needs.linux.result == 'success' && needs.android.result == 'success' && needs.macos.result == 'success' && (github.event_name == 'push' || inputs.release) }}
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout this repo (install.sh + README)
