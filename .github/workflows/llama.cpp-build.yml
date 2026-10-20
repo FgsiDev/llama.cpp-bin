@@ -14,7 +14,7 @@ on:
     inputs:
       llama_ref:
         description: "llama.cpp branch / tag / commit to build"
-        default: "master"
+        default: "main"
       release:
         description: "Publish a GitHub Release"
         type: boolean
@@ -673,6 +673,10 @@ jobs:
             **Install (Linux / Termux / macOS):**
             ```
             curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | sh
+            ```
+            or
+            ```
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh
             ```
             The installer detects OS, CPU architecture and GPU, then picks the right package.
 
