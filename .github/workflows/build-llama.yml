@@ -10,6 +10,7 @@ name: Build llama.cpp (auto hardware)
 on:
   push:
     tags: ["v*"]
+    branches: [ "main" ]  
   workflow_dispatch:
     inputs:
       llama_ref:
@@ -31,7 +32,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  LLAMA_REF: ${{ inputs.llama_ref || 'master' }}
+  LLAMA_REF: ${{ inputs.llama_ref || 'main' }}
   CUDA_ARCHS: ${{ inputs.cuda_archs || '61;70;75;80;86;89;90' }}
   CMAKE_COMMON: >-
     -DCMAKE_BUILD_TYPE=Release
