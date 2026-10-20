@@ -1,0 +1,693 @@
+name: Build llama.cpp (auto hardware)
+
+# Builds llama.cpp for every device family and publishes one release.
+# Each package uses ggml's dynamic backends (GGML_BACKEND_DL), so inside a package:
+#   - the best CPU variant (AVX2 / AVX512 / NEON / SVE ...) is picked at runtime
+#   - GPU backends (Vulkan / CUDA / ROCm / OpenCL / Metal) are loaded only if the
+#     hardware + driver exist, otherwise llama.cpp silently stays on CPU
+# install.sh picks the matching package for the machine it runs on.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      llama_ref:
+        description: "llama.cpp branch / tag / commit to build"
+        default: "master"
+      release:
+        description: "Publish a GitHub Release"
+        type: boolean
+        default: true
+      cuda_archs:
+        description: "CUDA architectures for the CUDA build"
+        default: "61;70;75;80;86;89;90"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: llama-build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  LLAMA_REF: ${{ inputs.llama_ref || 'master' }}
+  CUDA_ARCHS: ${{ inputs.cuda_archs || '61;70;75;80;86;89;90' }}
+  CMAKE_COMMON: >-
+    -DCMAKE_BUILD_TYPE=Release
+    -DLLAMA_BUILD_EXAMPLES=OFF
+    -DLLAMA_BUILD_TESTS=OFF
+    -DLLAMA_BUILD_TOOLS=ON
+    -DLLAMA_BUILD_SERVER=ON
+    -DGGML_RPC=ON
+
+jobs:
+  # ------------------------------------------------------------------
+  # Pin one llama.cpp commit for every job + build the server web UI once
+  # ------------------------------------------------------------------
+  ui:
+    name: Resolve commit + build UI
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.meta.outputs.sha }}
+      short: ${{ steps.meta.outputs.short }}
+      build: ${{ steps.meta.outputs.build }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ env.LLAMA_REF }}
+          fetch-depth: 0
+
+      - id: meta
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "build=b$(git rev-list --count HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Build UI
+        working-directory: tools/ui
+        env:
+          LLAMA_BUILD_NUMBER: ${{ steps.meta.outputs.build }}
+        run: |
+          npm ci
+          npm run build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ui-dist
+          path: tools/ui/dist/
+          retention-days: 1
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  # Linux: CPU (all variants) and Vulkan (CPU + any Vulkan GPU)
+  # ------------------------------------------------------------------
+  linux:
+    name: ${{ matrix.variant }}-linux-${{ matrix.arch }}
+    needs: ui
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { variant: cpu,    arch: x86_64,  os: ubuntu-22.04,     experimental: false }
+          - { variant: cpu,    arch: aarch64, os: ubuntu-24.04-arm, experimental: false }
+          - { variant: vulkan, arch: x86_64,  os: ubuntu-22.04,     experimental: true }
+          - { variant: vulkan, arch: aarch64, os: ubuntu-24.04-arm, experimental: true }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ needs.ui.outputs.sha }}
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: tools/ui/dist
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y build-essential libssl-dev git
+          if [ "${{ matrix.variant }}" = "vulkan" ]; then
+            if [ "${{ matrix.os }}" = "ubuntu-22.04" ]; then
+              wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
+              sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+              sudo apt-get update -y
+              sudo apt-get install -y mesa-vulkan-drivers vulkan-sdk
+            else
+              sudo apt-get install -y glslc libvulkan-dev spirv-headers
+            fi
+          fi
+          if [ "${{ matrix.os }}" = "ubuntu-24.04-arm" ]; then
+            sudo apt-get install -y gcc-14 g++-14
+            echo "CC=gcc-14" >> "$GITHUB_ENV"
+            echo "CXX=g++-14" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build
+        run: |
+          set -eo pipefail
+          run_build() { cmake -B build "$@" && cmake --build build --config Release -j"$(nproc)"; }
+          A=($CMAKE_COMMON -DGGML_BACKEND_DL=ON -DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=ON
+             -DCMAKE_INSTALL_RPATH='$ORIGIN' -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON)
+          if [ "${{ matrix.variant }}" = "vulkan" ]; then A+=(-DGGML_VULKAN=ON); fi
+          run_build "${A[@]}" -DLLAMA_BUILD_BORINGSSL=ON || {
+            echo "::warning::BoringSSL build failed, retrying with system OpenSSL"
+            rm -rf build
+            run_build "${A[@]}" -DLLAMA_BUILD_BORINGSSL=OFF
+          }
+
+      - name: Package
+        run: |
+          set -e
+          NAME="llama-${{ matrix.variant }}-linux-${{ matrix.arch }}"
+          mkdir -p "$NAME"
+          cp -a build/bin/. "$NAME"/
+          cp LICENSE "$NAME"/
+          printf 'variant=%s\nos=linux\narch=%s\nllama=%s\ncommit=%s\n' \
+            "${{ matrix.variant }}" "${{ matrix.arch }}" "${{ needs.ui.outputs.build }}" "${{ needs.ui.outputs.short }}" > "$NAME/BUILD_INFO"
+          tar -czf "$NAME.tar.gz" "$NAME"
+          ls -lh "$NAME.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llama-${{ matrix.variant }}-linux-${{ matrix.arch }}
+          path: llama-${{ matrix.variant }}-linux-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  # Linux ARMv7 (32-bit Raspberry Pi / old ARM boards), static, best effort
+  # ------------------------------------------------------------------
+  linux-armv7:
+    name: cpu-linux-armv7
+    needs: ui
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ needs.ui.outputs.sha }}
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: tools/ui/dist
+
+      - name: Build
+        run: |
+          set -eo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
+          run_build() { cmake -B build "$@" && cmake --build build --config Release -j"$(nproc)"; }
+          A=($CMAKE_COMMON -DBUILD_SHARED_LIBS=OFF -DGGML_BACKEND_DL=OFF -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF
+             -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=armv7l
+             -DCMAKE_C_COMPILER=arm-linux-gnueabihf-gcc -DCMAKE_CXX_COMPILER=arm-linux-gnueabihf-g++
+             -DCMAKE_C_FLAGS="-mfpu=neon-vfpv4 -mfloat-abi=hard"
+             -DCMAKE_CXX_FLAGS="-mfpu=neon-vfpv4 -mfloat-abi=hard"
+             -DCMAKE_EXE_LINKER_FLAGS="-static")
+          run_build "${A[@]}" -DLLAMA_BUILD_BORINGSSL=ON || {
+            echo "::warning::TLS build failed for armv7, retrying without TLS (use llama-get for HF downloads)"
+            rm -rf build
+            run_build "${A[@]}" -DLLAMA_BUILD_BORINGSSL=OFF -DLLAMA_OPENSSL=OFF
+          }
+
+      - name: Package
+        run: |
+          set -e
+          NAME="llama-cpu-linux-armv7"
+          mkdir -p "$NAME"
+          cp -a build/bin/. "$NAME"/
+          cp LICENSE "$NAME"/
+          printf 'variant=cpu\nos=linux\narch=armv7\nllama=%s\ncommit=%s\n' "${{ needs.ui.outputs.build }}" "${{ needs.ui.outputs.short }}" > "$NAME/BUILD_INFO"
+          tar -czf "$NAME.tar.gz" "$NAME"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llama-cpu-linux-armv7
+          path: llama-cpu-linux-armv7.tar.gz
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  # Linux NVIDIA CUDA 12 (CPU variants included; CUDA runtime shipped separately)
+  # ------------------------------------------------------------------
+  cuda:
+    name: cuda12-linux-x86_64
+    needs: ui
+    runs-on: ubuntu-22.04
+    container: nvidia/cuda:12.4.1-devel-ubuntu22.04
+    continue-on-error: true
+    timeout-minutes: 300
+    steps:
+      - name: Dependencies
+        run: |
+          apt-get update -y
+          apt-get install -y git cmake build-essential libssl-dev ca-certificates tar gzip
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ needs.ui.outputs.sha }}
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: tools/ui/dist
+
+      - name: Build
+        run: |
+          set -eo pipefail
+          run_build() { cmake -B build "$@" && cmake --build build --config Release -j"$(nproc)"; }
+          A=($CMAKE_COMMON -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS"
+             -DGGML_BACKEND_DL=ON -DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=ON
+             -DCMAKE_INSTALL_RPATH='$ORIGIN' -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON)
+          run_build "${A[@]}" -DLLAMA_BUILD_BORINGSSL=ON || {
+            echo "::warning::BoringSSL build failed, retrying with system OpenSSL"
+            rm -rf build
+            run_build "${A[@]}" -DLLAMA_BUILD_BORINGSSL=OFF
+          }
+
+      - name: Package
+        run: |
+          set -e
+          NAME="llama-cuda12-linux-x86_64"
+          mkdir -p "$NAME"
+          cp -a build/bin/. "$NAME"/
+          cp LICENSE "$NAME"/
+          printf 'variant=cuda12\nos=linux\narch=x86_64\nllama=%s\ncommit=%s\n' "${{ needs.ui.outputs.build }}" "${{ needs.ui.outputs.short }}" > "$NAME/BUILD_INFO"
+          tar -czf "$NAME.tar.gz" "$NAME"
+
+          # CUDA runtime libs, downloaded by install.sh only if the machine lacks them
+          RT="cudart-cuda12-linux-x86_64"
+          mkdir -p "$RT"
+          for p in libcudart.so.12 libcublas.so.12 libcublasLt.so.12; do
+            find /usr/local/cuda* /usr/lib/x86_64-linux-gnu -name "$p*" \( -type f -o -type l \) -exec cp -P {} "$RT"/ \; 2>/dev/null || true
+          done
+          ls "$RT" | grep -q '^libcublas\.so' || { echo "::error::cuBLAS runtime not found"; exit 1; }
+          tar -czf "$RT.tar.gz" "$RT"
+          ls -lh *.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llama-cuda12-linux-x86_64
+          path: |
+            llama-cuda12-linux-x86_64.tar.gz
+            cudart-cuda12-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  # Linux AMD ROCm / HIP (experimental)
+  # ------------------------------------------------------------------
+  rocm:
+    name: rocm-linux-x86_64
+    needs: ui
+    runs-on: ubuntu-22.04
+    container: rocm/dev-ubuntu-22.04:6.4-complete
+    continue-on-error: true
+    timeout-minutes: 300
+    steps:
+      - name: Dependencies
+        run: |
+          apt-get update -y
+          apt-get install -y git cmake build-essential libssl-dev ca-certificates
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ needs.ui.outputs.sha }}
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: tools/ui/dist
+
+      - name: Build
+        run: |
+          set -eo pipefail
+          export HIPCXX="$(hipconfig -l)/clang"
+          export HIP_PATH="$(hipconfig -R)"
+          run_build() { cmake -B build "$@" && cmake --build build --config Release -j"$(nproc)"; }
+          A=($CMAKE_COMMON -DGGML_HIP=ON
+             -DGPU_TARGETS="gfx906;gfx908;gfx90a;gfx942;gfx1030;gfx1100;gfx1101;gfx1102;gfx1200;gfx1201"
+             -DGGML_BACKEND_DL=ON -DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=ON
+             -DCMAKE_INSTALL_RPATH='$ORIGIN' -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON)
+          run_build "${A[@]}" -DLLAMA_BUILD_BORINGSSL=ON || {
+            echo "::warning::BoringSSL build failed, retrying with system OpenSSL"
+            rm -rf build
+            run_build "${A[@]}" -DLLAMA_BUILD_BORINGSSL=OFF
+          }
+
+      - name: Package
+        run: |
+          set -e
+          NAME="llama-rocm-linux-x86_64"
+          mkdir -p "$NAME"
+          cp -a build/bin/. "$NAME"/
+          cp LICENSE "$NAME"/
+          printf 'variant=rocm\nos=linux\narch=x86_64\nllama=%s\ncommit=%s\n' "${{ needs.ui.outputs.build }}" "${{ needs.ui.outputs.short }}" > "$NAME/BUILD_INFO"
+          tar -czf "$NAME.tar.gz" "$NAME"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llama-rocm-linux-x86_64
+          path: llama-rocm-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  # Android / Termux (bionic libc, built with the NDK)
+  # ------------------------------------------------------------------
+  android:
+    name: cpu-android-${{ matrix.arch }}
+    needs: ui
+    runs-on: ubuntu-24.04
+    continue-on-error: ${{ matrix.experimental }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 64-bit phones (almost everything since ~2017). CPU variants picked at runtime.
+          - arch: aarch64
+            abi: arm64-v8a
+            extra: "-DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON"
+            experimental: false
+          # 32-bit phones
+          - arch: armv7
+            abi: armeabi-v7a
+            extra: "-DBUILD_SHARED_LIBS=OFF -DGGML_BACKEND_DL=OFF -DGGML_CPU_ALL_VARIANTS=OFF"
+            experimental: true
+          # Chromebooks / emulators
+          - arch: x86_64
+            abi: x86_64
+            extra: "-DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON"
+            experimental: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ needs.ui.outputs.sha }}
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: tools/ui/dist
+
+      - name: Build
+        run: |
+          set -eo pipefail
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          test -d "$NDK" || { echo "::error::Android NDK not found on runner"; exit 1; }
+          run_build() { cmake -B build "$@" && cmake --build build --config Release -j"$(nproc)"; }
+          A=($CMAKE_COMMON
+             -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake"
+             -DANDROID_ABI=${{ matrix.abi }} -DANDROID_PLATFORM=android-28
+             -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DGGML_LLAMAFILE=OFF
+             -DCMAKE_INSTALL_RPATH='$ORIGIN' -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
+             ${{ matrix.extra }})
+          run_build "${A[@]}" -DLLAMA_BUILD_BORINGSSL=ON || {
+            echo "::warning::BoringSSL build failed, retrying without TLS (use llama-get for HF downloads)"
+            rm -rf build
+            run_build "${A[@]}" -DLLAMA_BUILD_BORINGSSL=OFF -DLLAMA_OPENSSL=OFF
+          }
+
+      - name: Package
+        run: |
+          set -e
+          NAME="llama-cpu-android-${{ matrix.arch }}"
+          mkdir -p "$NAME"
+          cp -a build/bin/. "$NAME"/
+          cp LICENSE "$NAME"/
+          printf 'variant=cpu\nos=android\narch=%s\nllama=%s\ncommit=%s\n' "${{ matrix.arch }}" "${{ needs.ui.outputs.build }}" "${{ needs.ui.outputs.short }}" > "$NAME/BUILD_INFO"
+          tar -czf "$NAME.tar.gz" "$NAME"
+          ls -lh "$NAME.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llama-cpu-android-${{ matrix.arch }}
+          path: llama-cpu-android-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  # Android GPU: OpenCL for Qualcomm Adreno (experimental, opt-in)
+  # ------------------------------------------------------------------
+  android-opencl:
+    name: opencl-android-aarch64
+    needs: ui
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ needs.ui.outputs.sha }}
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: tools/ui/dist
+
+      - name: OpenCL headers + ICD loader for the NDK
+        run: |
+          set -eo pipefail
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          SYSROOT="$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          git clone --depth 1 https://github.com/KhronosGroup/OpenCL-Headers
+          cp -r OpenCL-Headers/CL "$SYSROOT/usr/include/"
+          git clone --depth 1 https://github.com/KhronosGroup/OpenCL-ICD-Loader
+          cmake -S OpenCL-ICD-Loader -B icd-build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DOPENCL_ICD_LOADER_HEADERS_DIR="$SYSROOT/usr/include" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=24 -DANDROID_STL=c++_shared
+          cmake --build icd-build -j"$(nproc)"
+          cp icd-build/libOpenCL.so "$SYSROOT/usr/lib/aarch64-linux-android/"
+
+      - name: Build
+        run: |
+          set -eo pipefail
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          cmake -B build $CMAKE_COMMON \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-28 \
+            -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DGGML_LLAMAFILE=OFF \
+            -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGGML_OPENCL=ON -DGGML_OPENCL_USE_ADRENO_KERNELS=ON \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DLLAMA_BUILD_BORINGSSL=ON
+          cmake --build build --config Release -j"$(nproc)"
+
+      - name: Package
+        run: |
+          set -e
+          NAME="llama-opencl-android-aarch64"
+          mkdir -p "$NAME"
+          cp -a build/bin/. "$NAME"/
+          cp LICENSE "$NAME"/
+          printf 'variant=opencl\nos=android\narch=aarch64\nllama=%s\ncommit=%s\n' "${{ needs.ui.outputs.build }}" "${{ needs.ui.outputs.short }}" > "$NAME/BUILD_INFO"
+          tar -czf "$NAME.tar.gz" "$NAME"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llama-opencl-android-aarch64
+          path: llama-opencl-android-aarch64.tar.gz
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  # macOS
+  # ------------------------------------------------------------------
+  macos:
+    name: ${{ matrix.variant }}-macos-${{ matrix.arch }}
+    needs: ui
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { variant: metal, arch: aarch64, os: macos-14,       defines: "-DGGML_METAL_EMBED_LIBRARY=ON -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3" }
+          - { variant: cpu,   arch: x86_64,  os: macos-15-intel, defines: "-DGGML_METAL=OFF -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3" }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ needs.ui.outputs.sha }}
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: tools/ui/dist
+
+      - name: Build
+        run: |
+          set -eo pipefail
+          run_build() { cmake -B build "$@" && cmake --build build --config Release -j"$(sysctl -n hw.logicalcpu)"; }
+          A=($CMAKE_COMMON ${{ matrix.defines }}
+             -DCMAKE_INSTALL_RPATH='@loader_path' -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON)
+          run_build "${A[@]}" -DLLAMA_BUILD_BORINGSSL=ON || {
+            echo "::warning::BoringSSL build failed, retrying without TLS"
+            rm -rf build
+            run_build "${A[@]}" -DLLAMA_BUILD_BORINGSSL=OFF
+          }
+
+      - name: Package
+        run: |
+          set -e
+          NAME="llama-${{ matrix.variant }}-macos-${{ matrix.arch }}"
+          mkdir -p "$NAME"
+          cp -a build/bin/. "$NAME"/
+          cp LICENSE "$NAME"/
+          printf 'variant=%s\nos=macos\narch=%s\nllama=%s\ncommit=%s\n' \
+            "${{ matrix.variant }}" "${{ matrix.arch }}" "${{ needs.ui.outputs.build }}" "${{ needs.ui.outputs.short }}" > "$NAME/BUILD_INFO"
+          tar -czf "$NAME.tar.gz" "$NAME"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llama-${{ matrix.variant }}-macos-${{ matrix.arch }}
+          path: llama-${{ matrix.variant }}-macos-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  # Windows (CPU all variants; Vulkan backend DLL is merged in at release time)
+  # ------------------------------------------------------------------
+  windows-cpu:
+    name: cpu-windows-x86_64
+    needs: ui
+    runs-on: windows-2022
+    continue-on-error: true
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ needs.ui.outputs.sha }}
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: tools/ui/dist
+
+      - name: Install Ninja
+        run: choco install ninja -y
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_CPU_ALL_VARIANTS=ON ^
+            -DGGML_OPENMP=ON ^
+            -DGGML_OPENMP_FETCH=ON ^
+            %CMAKE_COMMON%
+          cmake --build build --config Release
+
+      - name: Package
+        run: 7z a -snl llama-cpu-windows-x86_64.zip .\build\bin\Release\* .\LICENSE
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llama-cpu-windows-x86_64
+          path: llama-cpu-windows-x86_64.zip
+          if-no-files-found: error
+
+  windows-vulkan:
+    name: vulkan-backend-windows-x86_64
+    needs: ui
+    runs-on: windows-2022
+    continue-on-error: true
+    timeout-minutes: 120
+    env:
+      VULKAN_VERSION: 1.4.357.0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ needs.ui.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Install Vulkan SDK
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+
+      - name: Build Vulkan backend
+        run: |
+          cmake -S . -B build -DGGML_VULKAN=ON -DGGML_NATIVE=OFF -DGGML_CPU=OFF -DGGML_BACKEND_DL=ON -DLLAMA_BUILD_BORINGSSL=ON
+          cmake --build build --config Release --target ggml-vulkan
+
+      - name: Package
+        run: 7z a -snl vulkan-backend-windows-x86_64.zip .\build\bin\Release\ggml-vulkan.dll
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llama-vulkan-backend-windows-x86_64
+          path: vulkan-backend-windows-x86_64.zip
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  # Release
+  # ------------------------------------------------------------------
+  release:
+    name: Publish release
+    needs: [ui, linux, linux-armv7, cuda, rocm, android, android-opencl, macos, windows-cpu, windows-vulkan]
+    if: ${{ !cancelled() && needs.ui.result == 'success' && needs.linux.result == 'success' && needs.android.result == 'success' && needs.macos.result == 'success' && (github.ref_type == 'tag' || inputs.release) }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout this repo (install.sh + README)
+        uses: actions/checkout@v4
+        with:
+          path: self
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+          pattern: "llama-*"
+
+      - name: Merge Windows Vulkan backend into a full package
+        run: |
+          set -e
+          cd dist
+          if [ -f llama-cpu-windows-x86_64.zip ] && [ -f vulkan-backend-windows-x86_64.zip ]; then
+            tmp="$(mktemp -d)"
+            unzip -q llama-cpu-windows-x86_64.zip -d "$tmp"
+            unzip -q -o vulkan-backend-windows-x86_64.zip -d "$tmp"
+            (cd "$tmp" && zip -qr -y "$GITHUB_WORKSPACE/dist/llama-vulkan-windows-x86_64.zip" .)
+          fi
+          rm -f vulkan-backend-windows-x86_64.zip
+          sed "s#__REPO__#${{ github.repository }}#g" "$GITHUB_WORKSPACE/self/install.sh" > install.sh
+          sha256sum *.tar.gz *.zip > SHA256SUMS.txt
+          ls -lh
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || needs.ui.outputs.build }}
+          name: llama.cpp ${{ needs.ui.outputs.build }} (${{ needs.ui.outputs.short }})
+          files: dist/*
+          body: |
+            llama.cpp `${{ needs.ui.outputs.build }}` (`${{ needs.ui.outputs.short }}`), auto-hardware builds.
+
+            **Install (Linux / Termux / macOS):**
+            ```
+            curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | sh
+            ```
+            The installer detects OS, CPU architecture and GPU, then picks the right package.
+
+            | Package | Hardware |
+            |---|---|
+            | `llama-cpu-android-aarch64` | Termux / Android 64-bit (CPU variants picked at runtime) |
+            | `llama-cpu-android-armv7` | Termux / Android 32-bit (best effort) |
+            | `llama-cpu-android-x86_64` | Android x86_64 / Chromebook (best effort) |
+            | `llama-opencl-android-aarch64` | Snapdragon Adreno GPU, experimental, opt-in |
+            | `llama-cpu-linux-x86_64` / `-aarch64` / `-armv7` | VPS, PC, ARM server, Raspberry Pi |
+            | `llama-vulkan-linux-x86_64` / `-aarch64` | Any Vulkan GPU (NVIDIA / AMD / Intel), falls back to CPU |
+            | `llama-cuda12-linux-x86_64` (+ `cudart-...`) | NVIDIA GPU, driver 525+ |
+            | `llama-rocm-linux-x86_64` | AMD GPU with ROCm installed (experimental) |
+            | `llama-metal-macos-aarch64` | Apple Silicon (Metal) |
+            | `llama-cpu-macos-x86_64` | Intel Mac |
+            | `llama-cpu-windows-x86_64.zip` / `llama-vulkan-windows-x86_64.zip` | Windows 10/11 |
+
+            Checksums are in `SHA256SUMS.txt`. Google TPU is not supported by llama.cpp, TPU VMs run the CPU package.
