@@ -7,7 +7,7 @@ Build otomatis [llama.cpp](https://github.com/ggml-org/llama.cpp) lewat GitHub A
 Linux, Termux, macOS:
 
 ```sh
-curl -fsSL https://github.com/FgsiDev/llama.cpp-bin/releases/latest/download/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/FgsiDev/llama.cpp-bin/main/install.sh | sh
 ```
 
 Windows: download zip `llama-cpu-windows-x86_64` atau `llama-vulkan-windows-x86_64` dari halaman Releases.
