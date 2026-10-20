@@ -1,7 +1,7 @@
 #!/bin/sh
 # llama.cpp auto installer: detects OS, CPU arch and GPU, then installs the matching build.
 #
-#   curl -fsSL https://github.com/__REPO__/releases/latest/download/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/FgsiDev/llama.cpp-bin/main/install.sh | sh
 #
 # Env overrides:
 #   LLAMA_REPO      GitHub repo that hosts the builds      (default: __REPO__)
